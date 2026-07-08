@@ -17,9 +17,14 @@ name = "mind-judge"
 path = "src/main.rs"
 
 [dependencies]
-judge = { git = "https://github.com/LiGoldragon/judge.git", branch = "main" }
-signal-mind-judge = { git = "https://github.com/LiGoldragon/signal-mind-judge.git", branch = "main" }
-thiserror = "2"
+judge             = { git = "https://github.com/LiGoldragon/judge.git", branch = "main" }
+nota              = { package = "nota", git = "https://github.com/LiGoldragon/nota-next.git", branch = "main" }
+signal-domain     = { git = "https://github.com/LiGoldragon/signal-domain.git", rev = "801e1c5bcc824c9760e246205826e3c8e962d005", default-features = false, features = ["nota-text"] }
+signal-frame      = { git = "https://github.com/LiGoldragon/signal-frame.git", branch = "main", default-features = false }
+signal-mind-judge = { git = "https://github.com/LiGoldragon/signal-mind-judge.git", rev = "9f9ae47e96454677c6158c3a227b0c9493b29d51", features = ["nota-text"] }
+tempfile          = "3"
+thiserror         = "2"
+tokio             = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 
 [lints.rust]
 unsafe_code = "forbid"
