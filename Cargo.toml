@@ -1,0 +1,27 @@
+[package]
+name         = "mind-judge"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.89"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/LiGoldragon/mind-judge"
+description  = "Mind judge text/model edge adapter."
+publish      = false
+
+[lib]
+name = "mind_judge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mind-judge"
+path = "src/main.rs"
+
+[dependencies]
+judge = { git = "https://github.com/LiGoldragon/judge.git", branch = "main" }
+signal-mind-judge = { git = "https://github.com/LiGoldragon/signal-mind-judge.git", branch = "main" }
+thiserror = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused      = { level = "warn", priority = -1 }
+dead_code   = "warn"
