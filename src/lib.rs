@@ -15,14 +15,10 @@ use judge::{
     ProviderName, ResolvedProviderAuthorization,
 };
 use nota::{NotaEncode, NotaSource};
-use signal_frame::{
-    ExchangeIdentifier, ExchangeLane, LaneSequence, NonEmpty, Reply, RequestPayload, SessionEpoch,
-    SubReply,
-};
 use signal_mind_judge::{
-    KnowledgeJudgePacket, KnowledgeJudgeResponse, MindJudgeFrame, MindJudgeFrameBody,
-    MindJudgeReply, MindJudgeRequest, MindJudgeRequestRejection, MindJudgeRequestRejectionReason,
-    TextBody,
+    KnowledgeJudgePacket, KnowledgeJudgeResponse, MindJudgeFrame, MindJudgeFrameCodec,
+    MindJudgeFrameCodecError, MindJudgeReply, MindJudgeRequest, MindJudgeRequestRejection,
+    MindJudgeRequestRejectionReason, TextBody,
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,7 +27,6 @@ use tokio::time::timeout;
 
 pub const DEFAULT_LIVE_MODEL: &str = "chatgpt-5.4-mini";
 const ACCEPTED_KNOWLEDGE_PROMPT_PATH: &str = "prompts/accepted-knowledge/system.md";
-const DEFAULT_MAXIMUM_FRAME_BYTES: usize = 1024 * 1024;
 
 pub type AdapterRequest = MindJudgeRequest;
 pub type AdapterReply = MindJudgeReply;
@@ -257,6 +252,15 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MindJudgeSocketPath(PathBuf);
 
+impl Error {
+    fn from_frame_codec(error: MindJudgeFrameCodecError) -> Self {
+        match error {
+            MindJudgeFrameCodecError::Io(error) => Self::Socket(error),
+            other => Self::Frame(other.to_string()),
+        }
+    }
+}
+
 impl MindJudgeSocketPath {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self(path.into())
@@ -275,103 +279,47 @@ impl MindJudgeSocketPath {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MindJudgeFrameCodec {
-    maximum_frame_bytes: usize,
+struct MindJudgeSocketExchange<'a> {
+    stream: &'a mut UnixStream,
+    codec: MindJudgeFrameCodec,
 }
 
-impl MindJudgeFrameCodec {
-    pub const fn new(maximum_frame_bytes: usize) -> Self {
-        Self {
-            maximum_frame_bytes,
-        }
+impl<'a> MindJudgeSocketExchange<'a> {
+    fn new(stream: &'a mut UnixStream, codec: MindJudgeFrameCodec) -> Self {
+        Self { stream, codec }
     }
 
-    fn synthetic_exchange(&self) -> ExchangeIdentifier {
-        let _maximum_frame_bytes = self.maximum_frame_bytes;
-        ExchangeIdentifier::new(
-            SessionEpoch::new(0),
-            ExchangeLane::Connector,
-            LaneSequence::first(),
-        )
-    }
-
-    pub fn request_frame(&self, request: MindJudgeRequest) -> MindJudgeFrame {
-        MindJudgeFrame::new(MindJudgeFrameBody::Request {
-            exchange: self.synthetic_exchange(),
-            request: request.into_request(),
-        })
-    }
-
-    pub fn reply_frame(&self, reply: MindJudgeReply) -> MindJudgeFrame {
-        MindJudgeFrame::new(MindJudgeFrameBody::Reply {
-            exchange: self.synthetic_exchange(),
-            reply: Reply::committed(NonEmpty::single(SubReply::Ok(reply))),
-        })
-    }
-
-    pub async fn read_frame(&self, stream: &mut UnixStream) -> Result<MindJudgeFrame, Error> {
-        let mut length = [0_u8; 4];
-        stream
-            .read_exact(&mut length)
+    async fn read_frame(&mut self) -> Result<MindJudgeFrame, Error> {
+        let mut length_prefix = [0_u8; 4];
+        self.stream
+            .read_exact(&mut length_prefix)
             .await
             .map_err(Error::Socket)?;
-        let length = u32::from_be_bytes(length) as usize;
-        if length > self.maximum_frame_bytes {
-            return Err(Error::Frame(format!(
-                "frame has {length} bytes, limit is {}",
-                self.maximum_frame_bytes
-            )));
-        }
+        let length = self
+            .codec
+            .frame_payload_length(length_prefix)
+            .map_err(Error::from_frame_codec)?;
         let mut payload = vec![0_u8; length];
-        stream
+        self.stream
             .read_exact(&mut payload)
             .await
             .map_err(Error::Socket)?;
-        let mut frame = Vec::with_capacity(4 + payload.len());
-        frame.extend_from_slice(&(length as u32).to_be_bytes());
-        frame.extend_from_slice(&payload);
-        MindJudgeFrame::decode_length_prefixed(frame.as_slice())
-            .map_err(|error| Error::Frame(error.to_string()))
+        self.codec
+            .decode_frame_bytes(length_prefix, payload)
+            .map_err(Error::from_frame_codec)
     }
 
-    pub async fn write_frame(
-        &self,
-        stream: &mut UnixStream,
-        frame: &MindJudgeFrame,
-    ) -> Result<(), Error> {
-        let bytes = frame
-            .encode_length_prefixed()
-            .map_err(|error| Error::Frame(error.to_string()))?;
-        stream.write_all(&bytes).await.map_err(Error::Socket)?;
-        stream.flush().await.map_err(Error::Socket)?;
+    async fn write_frame(&mut self, frame: &MindJudgeFrame) -> Result<(), Error> {
+        let bytes = self
+            .codec
+            .encode_frame(frame)
+            .map_err(Error::from_frame_codec)?;
+        self.stream
+            .write_all(bytes.as_slice())
+            .await
+            .map_err(Error::Socket)?;
+        self.stream.flush().await.map_err(Error::Socket)?;
         Ok(())
-    }
-
-    pub fn request_from_frame(&self, frame: MindJudgeFrame) -> Result<MindJudgeRequest, Error> {
-        match frame.into_body() {
-            MindJudgeFrameBody::Request { request, .. } => Ok(request.payloads.into_head()),
-            _ => Err(Error::UnexpectedFrame("expected mind judge request")),
-        }
-    }
-
-    pub fn reply_from_frame(&self, frame: MindJudgeFrame) -> Result<MindJudgeReply, Error> {
-        match frame.into_body() {
-            MindJudgeFrameBody::Reply { reply, .. } => match reply {
-                Reply::Accepted { per_operation, .. } => match per_operation.into_head() {
-                    SubReply::Ok(payload) => Ok(payload),
-                    other => Err(Error::Frame(format!("unexpected sub-reply: {other:?}"))),
-                },
-                Reply::Rejected { reason } => Err(Error::Frame(reason.to_string())),
-            },
-            _ => Err(Error::UnexpectedFrame("expected mind judge reply")),
-        }
-    }
-}
-
-impl Default for MindJudgeFrameCodec {
-    fn default() -> Self {
-        Self::new(DEFAULT_MAXIMUM_FRAME_BYTES)
     }
 }
 
@@ -430,15 +378,18 @@ where
     }
 
     pub async fn serve_stream(&self, stream: &mut UnixStream) -> Result<MindJudgeReply, Error> {
-        let frame = self.codec.read_frame(stream).await?;
-        let request = self.codec.request_from_frame(frame)?;
-        let reply = self.adapter.judge(request);
-        let frame = self.codec.reply_frame(reply.clone());
-        self.codec.write_frame(stream, &frame).await?;
+        let mut exchange = MindJudgeSocketExchange::new(stream, self.codec);
+        let frame = exchange.read_frame().await?;
+        let received = self
+            .codec
+            .request_from_frame(frame)
+            .map_err(Error::from_frame_codec)?;
+        let reply = self.adapter.judge(received.request().clone());
+        let frame = received.reply_frame(reply.clone());
+        exchange.write_frame(&frame).await?;
         Ok(reply)
     }
 }
-
 pub struct MindJudgeClient {
     socket_path: MindJudgeSocketPath,
     codec: MindJudgeFrameCodec,
@@ -456,13 +407,15 @@ impl MindJudgeClient {
         let mut stream = UnixStream::connect(self.socket_path.as_path())
             .await
             .map_err(Error::Socket)?;
+        let mut exchange = MindJudgeSocketExchange::new(&mut stream, self.codec);
         let frame = self.codec.request_frame(request);
-        self.codec.write_frame(&mut stream, &frame).await?;
-        let frame = self.codec.read_frame(&mut stream).await?;
-        self.codec.reply_from_frame(frame)
+        exchange.write_frame(&frame).await?;
+        let frame = exchange.read_frame().await?;
+        self.codec
+            .reply_from_frame(frame)
+            .map_err(Error::from_frame_codec)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
