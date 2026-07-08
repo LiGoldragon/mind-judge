@@ -8,10 +8,11 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use judge::{
-    ProviderAuthorization, ProviderCallReply, ProviderCallRequest, ProviderClient, ProviderMessage,
-    ProviderModelName, ProviderName,
+    ProviderCallReply, ProviderCallRequest, ProviderClient, ProviderMessage, ProviderModelName,
+    ProviderName, ResolvedProviderAuthorization,
 };
 use nota::{NotaEncode, NotaSource};
 use signal_frame::{
@@ -26,6 +27,7 @@ use signal_mind_judge::{
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::time::timeout;
 
 pub const DEFAULT_LIVE_MODEL: &str = "chatgpt-5.4-mini";
 const ACCEPTED_KNOWLEDGE_PROMPT_PATH: &str = "prompts/accepted-knowledge/system.md";
@@ -91,7 +93,7 @@ pub struct MindJudgeAdapterConfiguration {
     configuration_path: MindJudgeConfigurationPath,
     provider_name: ProviderName,
     model_name: ProviderModelName,
-    authorization: ProviderAuthorization,
+    authorization: ResolvedProviderAuthorization,
 }
 
 impl MindJudgeAdapterConfiguration {
@@ -99,7 +101,7 @@ impl MindJudgeAdapterConfiguration {
         configuration_path: MindJudgeConfigurationPath,
         provider_name: ProviderName,
         model_name: ProviderModelName,
-        authorization: ProviderAuthorization,
+        authorization: ResolvedProviderAuthorization,
     ) -> Self {
         Self {
             configuration_path,
@@ -114,7 +116,7 @@ impl MindJudgeAdapterConfiguration {
             configuration_path,
             ProviderName::unchecked("fixture"),
             ProviderModelName::unchecked(DEFAULT_LIVE_MODEL),
-            ProviderAuthorization::no_secret(),
+            ResolvedProviderAuthorization::no_secret(),
         )
     }
 
@@ -130,7 +132,7 @@ impl MindJudgeAdapterConfiguration {
         &self.model_name
     }
 
-    pub fn authorization(&self) -> &ProviderAuthorization {
+    pub fn authorization(&self) -> &ResolvedProviderAuthorization {
         &self.authorization
     }
 }
@@ -394,10 +396,37 @@ where
     pub async fn serve_one(self) -> Result<MindJudgeReply, Error> {
         self.socket_path.remove_stale()?;
         let listener = UnixListener::bind(self.socket_path.as_path()).map_err(Error::Socket)?;
-        let (mut stream, _) = listener.accept().await.map_err(Error::Socket)?;
-        let reply = self.serve_stream(&mut stream).await?;
+        let result = async {
+            let (mut stream, _) = listener.accept().await.map_err(Error::Socket)?;
+            self.serve_stream(&mut stream).await
+        }
+        .await;
         self.socket_path.remove_stale()?;
-        Ok(reply)
+        result
+    }
+
+    /// Serve sequential direct-bind connections until no client arrives within
+    /// `idle_timeout`. Inherited socket-activation file descriptors are still a
+    /// follow-up; this loop is the non-activated semi-persistent runtime path.
+    pub async fn serve_until_idle(self, idle_timeout: Duration) -> Result<usize, Error> {
+        self.socket_path.remove_stale()?;
+        let listener = UnixListener::bind(self.socket_path.as_path()).map_err(Error::Socket)?;
+        let mut served = 0;
+        let result = async {
+            loop {
+                let accepted = timeout(idle_timeout, listener.accept()).await;
+                let (mut stream, _) = match accepted {
+                    Ok(Ok(accepted)) => accepted,
+                    Ok(Err(error)) => return Err(Error::Socket(error)),
+                    Err(_elapsed) => return Ok(served),
+                };
+                self.serve_stream(&mut stream).await?;
+                served += 1;
+            }
+        }
+        .await;
+        self.socket_path.remove_stale()?;
+        result
     }
 
     pub async fn serve_stream(&self, stream: &mut UnixStream) -> Result<MindJudgeReply, Error> {
@@ -536,6 +565,32 @@ mod tests {
 
         assert_eq!(reply, served_reply);
         assert!(matches!(reply, MindJudgeReply::KnowledgeJudged(_)));
+    }
+
+    #[tokio::test]
+    async fn direct_bind_server_handles_multiple_sequential_requests() {
+        let configuration = TestConfiguration::new("Prompt from temp config.");
+        let socket = configuration.temporary.path().join("mind-judge-loop.sock");
+        let server = MindJudgeSocketServer::new(
+            MindJudgeSocketPath::new(&socket),
+            MindJudgeAdapter::new(
+                MindJudgeAdapterConfiguration::fixture(configuration.root()),
+                FixtureProviderClient::from_text("(Accept None)"),
+            ),
+        );
+        let server_task = tokio::spawn(server.serve_until_idle(Duration::from_millis(50)));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let client = MindJudgeClient::new(MindJudgeSocketPath::new(socket));
+
+        for _ in 0..2 {
+            let reply = client
+                .submit(MindJudgeRequest::JudgeKnowledge(SelfPacket::packet()))
+                .await
+                .unwrap();
+            assert!(matches!(reply, MindJudgeReply::KnowledgeJudged(_)));
+        }
+
+        assert_eq!(server_task.await.unwrap().unwrap(), 2);
     }
 
     struct SelfPacket;

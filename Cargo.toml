@@ -16,6 +16,10 @@ path = "src/lib.rs"
 name = "mind-judge"
 path = "src/main.rs"
 
+[features]
+default = []
+live-provider = ["judge/live-provider"]
+
 [dependencies]
 judge             = { git = "https://github.com/LiGoldragon/judge.git", branch = "main" }
 nota              = { package = "nota", git = "https://github.com/LiGoldragon/nota-next.git", branch = "main" }

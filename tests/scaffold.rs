@@ -6,9 +6,7 @@ fn adapter_configuration_names_external_prompt_root() {
         MindJudgeConfigurationPath::new("/tmp/mind-judge-config").unwrap(),
         judge::ProviderName::new("provider").unwrap(),
         judge::ProviderModelName::new("model").unwrap(),
-        judge::ProviderAuthorization::secret_source(
-            judge::SecretSourceReference::new("secret-handle").unwrap(),
-        ),
+        judge::ResolvedProviderAuthorization::no_secret(),
     );
     let adapter = MindJudgeAdapter::new(
         configuration,
